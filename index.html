@@ -217,6 +217,124 @@
 (function () {
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 
+  // ============ Rasch modeli (rasch.py bilan bir xil JMLE algoritmi) ============
+  function raschProb(theta, b) {
+    const x = theta - b;
+    if (x > 30) return 1.0;
+    if (x < -30) return 0.0;
+    const e = Math.exp(x);
+    return e / (1 + e);
+  }
+
+  function estimateRasch(X, maxIter = 200, tol = 1e-3) {
+    const nStudents = X.length;
+    const nItems = nStudents ? X[0].length : 0;
+
+    const personMax = X.map(row => row.filter(v => v !== null).length);
+    const personScore = X.map(row => row.reduce((s, v) => s + (v !== null ? v : 0), 0));
+    const itemMax = Array(nItems).fill(0).map((_, i) => X.filter(row => row[i] !== null).length);
+    const itemScore = Array(nItems).fill(0).map((_, i) => X.reduce((s, row) => s + (row[i] !== null ? row[i] : 0), 0));
+
+    const excludedStudents = [];
+    const activeStudents = [];
+    for (let n = 0; n < nStudents; n++) {
+      if (personMax[n] === 0 || personScore[n] === 0 || personScore[n] === personMax[n]) excludedStudents.push(n);
+      else activeStudents.push(n);
+    }
+    const excludedItems = [];
+    const activeItems = [];
+    for (let i = 0; i < nItems; i++) {
+      if (itemMax[i] === 0 || itemScore[i] === 0 || itemScore[i] === itemMax[i]) excludedItems.push(i);
+      else activeItems.push(i);
+    }
+
+    const activePersonTarget = Array(nStudents).fill(0);
+    const activePersonN = Array(nStudents).fill(0);
+    for (const n of activeStudents) for (const i of activeItems) {
+      const v = X[n][i];
+      if (v !== null) { activePersonTarget[n] += v; activePersonN[n] += 1; }
+    }
+    const activeItemTarget = Array(nItems).fill(0);
+    const activeItemN = Array(nItems).fill(0);
+    for (const i of activeItems) for (const n of activeStudents) {
+      const v = X[n][i];
+      if (v !== null) { activeItemTarget[i] += v; activeItemN[i] += 1; }
+    }
+
+    let theta = Array(nStudents).fill(0.0);
+    let b = Array(nItems).fill(0.0);
+    for (const n of activeStudents) {
+      if (activePersonN[n] === 0) continue;
+      let p = Math.min(Math.max(activePersonTarget[n] / activePersonN[n], 0.02), 0.98);
+      theta[n] = Math.log(p / (1 - p));
+    }
+    for (const i of activeItems) {
+      if (activeItemN[i] === 0) continue;
+      let p = Math.min(Math.max(activeItemTarget[i] / activeItemN[i], 0.02), 0.98);
+      b[i] = -Math.log(p / (1 - p));
+    }
+
+    for (let iter = 0; iter < maxIter; iter++) {
+      let maxChange = 0.0;
+      const newTheta = theta.slice();
+      for (const n of activeStudents) {
+        const row = X[n];
+        let expScore = 0.0, info = 0.0;
+        for (const i of activeItems) {
+          const v = row[i];
+          if (v === null) continue;
+          const p = raschProb(theta[n], b[i]);
+          expScore += p; info += p * (1 - p);
+        }
+        if (info < 1e-6) continue;
+        let delta = Math.max(Math.min((activePersonTarget[n] - expScore) / info, 2.0), -2.0);
+        newTheta[n] = theta[n] + delta;
+        maxChange = Math.max(maxChange, Math.abs(delta));
+      }
+      theta = newTheta;
+
+      const newB = b.slice();
+      for (const i of activeItems) {
+        let expScore = 0.0, info = 0.0;
+        for (const n of activeStudents) {
+          const v = X[n][i];
+          if (v === null) continue;
+          const p = raschProb(theta[n], b[i]);
+          expScore += p; info += p * (1 - p);
+        }
+        if (info < 1e-6) continue;
+        let delta = Math.max(Math.min((expScore - activeItemTarget[i]) / info, 2.0), -2.0);
+        newB[i] = b[i] + delta;
+        maxChange = Math.max(maxChange, Math.abs(delta));
+      }
+      b = newB;
+
+      if (activeItems.length) {
+        const meanB = activeItems.reduce((s, i) => s + b[i], 0) / activeItems.length;
+        for (const i of activeItems) b[i] -= meanB;
+      }
+      if (maxChange < tol) break;
+    }
+
+    return { theta, b, meta: { excludedStudents, excludedItems, personScore, personMax, itemScore, itemMax } };
+  }
+
+  function thetaToScaledScore(theta, thetaMin = -4.0, thetaMax = 4.0) {
+    const t = Math.max(Math.min(theta, thetaMax), thetaMin);
+    return ((t - thetaMin) / (thetaMax - thetaMin)) * 100;
+  }
+
+  function scoreToDaraja(s) {
+    if (s >= 70) return "A+";
+    if (s >= 65) return "A";
+    if (s >= 60) return "B+";
+    if (s >= 55) return "B";
+    if (s >= 50) return "C+";
+    if (s >= 46) return "C";
+    return "—";
+  }
+  // ============ /Rasch modeli ============
+
   // --- Parametrlarni URL'dan olish ---
   const params = new URLSearchParams(window.location.search);
   const nStudents = Math.max(1, Math.min(200, parseInt(params.get('students') || '17', 10)));
@@ -330,32 +448,170 @@
     };
   }
 
-  function submit() {
+  function showCopyFallback(json) {
+    const wrap = document.getElementById('gridWrap');
+    const box = document.createElement('div');
+    box.style.cssText = 'margin:16px;padding:16px;background:var(--secondary-bg);border-radius:12px;';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:700;font-size:14px;margin-bottom:8px;';
+    title.textContent = "Endi shu matnni nusxalab, botga xabar sifatida yuboring:";
+    box.appendChild(title);
+
+    const textarea = document.createElement('textarea');
+    textarea.value = json;
+    textarea.readOnly = true;
+    textarea.style.cssText = 'width:100%;height:100px;font-size:11px;font-family:monospace;padding:8px;border-radius:8px;border:1px solid var(--border);box-sizing:border-box;';
+    box.appendChild(textarea);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = 'Nusxalash';
+    copyBtn.style.cssText = 'margin-top:10px;width:100%;padding:12px;border-radius:10px;border:none;background:var(--accent);color:var(--accent-text);font-weight:700;font-size:14px;';
+    copyBtn.addEventListener('click', () => {
+      textarea.select();
+      textarea.setSelectionRange(0, textarea.value.length);
+      const done = () => {
+        copyBtn.textContent = 'Nusxalandi ✓';
+        setTimeout(() => { copyBtn.textContent = 'Nusxalash'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(json).then(done).catch(() => { document.execCommand('copy'); done(); });
+      } else {
+        document.execCommand('copy'); done();
+      }
+    });
+    box.appendChild(copyBtn);
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'margin-top:8px;font-size:12px;color:var(--hint);';
+    hint.textContent = "Nusxalagach, botingiz bilan suhbatga qaytib, shu matnni oddiy xabar sifatida joylab (paste qilib) yuboring.";
+    box.appendChild(hint);
+
+    wrap.prepend(box);
+    if (typeof box.scrollIntoView === 'function') {
+      box.scrollIntoView({ behavior: 'smooth' });
+    }
+  }
+
+  function buildPayload() {
+    return {
+      class: className,
+      n_items: nItems,
+      students: state.names.map((name, i) => ({
+        name: name && name.trim() ? name.trim() : `O'quvchi ${i + 1}`,
+        answers: state.answers[i].join(''),
+      })),
+    };
+  }
+
+  function sendToBot() {
     const payload = buildPayload();
     const json = JSON.stringify(payload);
     if (tg) {
       tg.sendData(json);
-      tg.close();
+      // Telegram bu chaqiruvdan keyin ilovani o'zi yopadi.
     } else {
-      // Telegram tashqarisida ochilgan bo'lsa (masalan test uchun brauzerda) —
-      // konsolga chiqaramiz, chunki sendData faqat Telegram ichida ishlaydi.
-      console.log('Yuborilgan payload (Telegram tashqarisida, faqat ko\'rish uchun):', payload);
-      alert("Bu ilova Telegram ichida ochilganda ma'lumotni botga yuboradi.");
+      showCopyFallback(json);
+    }
+  }
+
+  // --- Natijalar ekranini chizish (Yakunlash bosilgach) ---
+  function showResults() {
+    const payload = buildPayload();
+
+    // JS'dagi mahalliy Rasch hisob-kitobi (bot tomonidagi Python bilan bir xil)
+    const X = payload.students.map(s =>
+      Array.from(s.answers).map(ch => (ch === '1' ? 1 : ch === '0' ? 0 : null))
+    );
+    const { theta, meta } = estimateRasch(X);
+
+    const rows = payload.students.map((s, i) => {
+      const excluded = meta.excludedStudents.includes(i);
+      const score = excluded ? null : thetaToScaledScore(theta[i]);
+      return {
+        name: s.name,
+        raw: meta.personScore[i],
+        max: meta.personMax[i],
+        score,
+        daraja: excluded ? null : scoreToDaraja(score),
+      };
+    });
+    rows.sort((a, b) => (b.score ?? -999) - (a.score ?? -999));
+
+    const wrap = document.getElementById('gridWrap');
+    wrap.innerHTML = '';
+
+    const box = document.createElement('div');
+    box.style.cssText = 'padding:14px 16px;';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:15px;font-weight:700;margin-bottom:10px;';
+    title.textContent = `Natijalar (${className})`;
+    box.appendChild(title);
+
+    for (const r of rows) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 12px;margin-bottom:6px;background:var(--secondary-bg);border-radius:10px;';
+
+      const left = document.createElement('div');
+      left.style.cssText = 'font-size:13.5px;font-weight:600;';
+      left.textContent = r.name;
+
+      const right = document.createElement('div');
+      right.style.cssText = 'font-size:13px;text-align:right;';
+      if (r.score === null) {
+        right.style.color = 'var(--hint)';
+        right.textContent = `${r.raw}/${r.max} — hisoblanmadi`;
+      } else {
+        right.innerHTML = `${r.raw}/${r.max} &nbsp; <b>${r.score.toFixed(1)}</b> (${r.daraja})`;
+      }
+
+      row.appendChild(left);
+      row.appendChild(right);
+      box.appendChild(row);
+    }
+
+    const note = document.createElement('div');
+    note.style.cssText = 'margin-top:12px;font-size:12px;color:var(--hint);text-align:center;';
+    note.textContent = 'Botga yuborilmoqda...';
+    box.appendChild(note);
+
+    wrap.appendChild(box);
+  }
+
+  render();
+
+  // --- "Hammasini to'g'ri qilish" ---
+  document.getElementById('resetAllBtn').addEventListener('click', () => {
+    state.answers = Array.from({ length: nStudents }, () => Array(nItems).fill('1'));
+    render();
+  });
+
+  // --- Yakunlash: avval natijani ko'rsatadi, keyin qisqa pauzadan so'ng
+  //     avtomatik botga yuboradi (Telegram sendData chaqirilgach ilovani
+  //     o'zi yopib qo'yadi — buni o'zgartirib bo'lmaydi).
+  function finish() {
+    showResults();
+    if (tg) {
+      tg.MainButton.hide();
+      setTimeout(sendToBot, 1400);
+    } else {
+      // Telegram tashqarisida — darhol matnli natijani ko'rsatamiz
+      sendToBot();
     }
   }
 
   if (tg) {
     tg.ready();
     tg.expand();
-    tg.MainButton.setText('Yuborish');
+    tg.MainButton.setText('Yakunlash');
     tg.MainButton.show();
-    tg.MainButton.onClick(submit);
+    tg.MainButton.onClick(finish);
   } else {
-    // Telegram tashqarisida sinash uchun pastda oddiy tugma ko'rsatamiz
     const btn = document.createElement('button');
-    btn.textContent = 'Yuborish (sinov rejimi)';
+    btn.textContent = 'Yakunlash';
     btn.style.cssText = 'position:fixed;bottom:12px;left:16px;right:16px;padding:14px;border-radius:12px;border:none;background:var(--accent);color:var(--accent-text);font-weight:700;font-size:15px;z-index:40;';
-    btn.addEventListener('click', submit);
+    btn.addEventListener('click', finish);
     document.body.appendChild(btn);
   }
 })();
